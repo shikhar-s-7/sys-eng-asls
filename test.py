@@ -3,11 +3,12 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+from urllib.parse import urlencode
 
 st.set_page_config(page_title="ASLS – Azimuth Offset Planner", layout="wide")
 
 st.title("🎯 ASLS Azimuth Offset Planner")
-st.markdown("Click the button below to use your device's actual location (GPS). Works worldwide.")
+st.markdown("Get your location (GPS), live wind, and the exact azimuth offset to rotate the bipod.")
 
 # ========== Constants ==========
 g = 9.81
@@ -65,31 +66,46 @@ def apex_height(v0, theta_deg):
 def horizontal_range(v0, theta_deg):
     return (v0**2 * np.sin(2 * np.radians(theta_deg))) / g
 
-# ========== Check URL for coordinates from geolocation ==========
+# ========== URL parameters ==========
 query_params = st.query_params
+
+# Check if we have coordinates from geolocation
 if "lat" in query_params and "lon" in query_params:
     try:
-        user_lat = float(query_params["lat"])
-        user_lon = float(query_params["lon"])
-        st.session_state.user_lat = user_lat
-        st.session_state.user_lon = user_lon
-        st.session_state.location_source = "device"
-        # Clear params so they don't persist
+        lat = float(query_params["lat"])
+        lon = float(query_params["lon"])
+        # Store in session state
+        st.session_state.user_lat = lat
+        st.session_state.user_lon = lon
+        # Clear params to avoid re-processing
         st.query_params.clear()
+        # Fetch weather for these coordinates
+        with st.spinner("Fetching live wind data for your location..."):
+            speed, direction = get_weather(lat, lon)
+            if speed is not None:
+                st.session_state.wind_speed = speed
+                st.session_state.wind_dir = direction
+                st.session_state.location_fetched = True
+                st.success(f"Location detected! Wind: {speed} km/h from {direction}°")
+            else:
+                st.warning("Weather data not available for these coordinates.")
+                st.session_state.location_fetched = False
     except:
         pass
 
-# ========== Session state defaults ==========
-if "user_lat" not in st.session_state:
-    st.session_state.user_lat = None
-if "user_lon" not in st.session_state:
-    st.session_state.user_lon = None
+# ========== Session state initialisation ==========
 if "wind_speed" not in st.session_state:
     st.session_state.wind_speed = 25
 if "wind_dir" not in st.session_state:
     st.session_state.wind_dir = 90
 if "user_heading" not in st.session_state:
     st.session_state.user_heading = 0
+if "user_lat" not in st.session_state:
+    st.session_state.user_lat = None
+if "user_lon" not in st.session_state:
+    st.session_state.user_lon = None
+if "location_fetched" not in st.session_state:
+    st.session_state.location_fetched = False
 if "pressure" not in st.session_state:
     st.session_state.pressure = REGULATED_PSI
 if "barrel" not in st.session_state:
@@ -100,19 +116,17 @@ if "rain" not in st.session_state:
     st.session_state.rain = False
 if "load_height" not in st.session_state:
     st.session_state.load_height = LOAD_HEIGHT_DEFAULT
-if "weather_fetched" not in st.session_state:
-    st.session_state.weather_fetched = False
 
-# ========== Sidebar ==========
-st.sidebar.header("📍 Your Device Location")
+# ========== Sidebar: Location and Wind ==========
+st.sidebar.header("📍 Location & Wind")
 
-# Geolocation button (HTML/JS)
+# HTML/JS geolocation button (no extra package)
 geo_html = """
-<div id="geo-status" style="margin-bottom: 10px; font-size:0.9rem;"></div>
-<button id="get-location" style="padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">📍 Get My Device Location</button>
+<div id="geo-status" style="margin-bottom: 10px; font-size:0.9rem; color: #888;"></div>
+<button id="geo-btn" style="padding: 8px 16px; background-color: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer;">📍 Get My Current Location (GPS)</button>
 <script>
+    const btn = document.getElementById('geo-btn');
     const statusDiv = document.getElementById('geo-status');
-    const btn = document.getElementById('get-location');
     btn.onclick = () => {
         if (!navigator.geolocation) {
             statusDiv.innerHTML = "Geolocation not supported by this browser.";
@@ -123,42 +137,32 @@ geo_html = """
             (position) => {
                 const lat = position.coords.latitude;
                 const lon = position.coords.longitude;
+                statusDiv.innerHTML = "Location obtained. Reloading...";
                 const url = new URL(window.location.href);
                 url.searchParams.set('lat', lat);
                 url.searchParams.set('lon', lon);
                 window.location.href = url.toString();
             },
             (error) => {
-                statusDiv.innerHTML = "Error: " + error.message;
+                statusDiv.innerHTML = "Error: " + error.message + ". Try allowing location in browser settings.";
             }
         );
     };
 </script>
 """
 with st.sidebar:
-    st.components.v1.html(geo_html, height=120)
-    st.caption("Click button, allow permission, then page reloads with your location.")
+    st.components.v1.html(geo_html, height=100)
+    st.caption("Click the button, allow location, then the page reloads with your coordinates.")
 
-# Show location status and fetch weather if we have coordinates
-if st.session_state.user_lat is not None:
-    st.sidebar.success(f"📍 Coordinates: {st.session_state.user_lat:.3f}, {st.session_state.user_lon:.3f}")
-    if not st.session_state.weather_fetched:
-        with st.spinner("Fetching wind data for your location..."):
-            speed, direction = get_weather(st.session_state.user_lat, st.session_state.user_lon)
-            if speed is not None:
-                st.session_state.wind_speed = speed
-                st.session_state.wind_dir = direction
-                st.sidebar.success(f"🌬️ Wind: {speed:.1f} km/h from {direction:.0f}°")
-            else:
-                st.sidebar.warning("Wind data unavailable. Use manual override below.")
-            st.session_state.weather_fetched = True
+if st.session_state.user_lat:
+    st.sidebar.success(f"✅ Coordinates: {st.session_state.user_lat:.3f}, {st.session_state.user_lon:.3f}")
+    st.sidebar.metric("🌬️ Wind used", f"{st.session_state.wind_speed} km/h from {st.session_state.wind_dir}°")
 else:
-    st.sidebar.info("No location yet. Click the button above.")
+    st.sidebar.info("No location yet. Click the button above (on phone, allow GPS).")
 
-# Manual override
 st.sidebar.markdown("---")
 st.sidebar.subheader("✍️ Manual Override")
-use_manual = st.sidebar.checkbox("Use manual wind/heading", value=False)
+use_manual = st.sidebar.checkbox("Enter wind/heading manually", value=False)
 if use_manual:
     manual_speed = st.sidebar.number_input("Wind speed (km/h)", 0, 100, st.session_state.wind_speed)
     manual_dir = st.sidebar.number_input("Wind direction (deg)", 0, 360, st.session_state.wind_dir)
@@ -166,11 +170,16 @@ if use_manual:
     st.session_state.wind_speed = manual_speed
     st.session_state.wind_dir = manual_dir
     st.session_state.user_heading = manual_heading
+    st.session_state.location_fetched = True   # treat as ready
+else:
+    # If manual not active and we have a location, keep that; if no location, keep default values
+    pass
 
-st.sidebar.metric("🌬️ Wind used", f"{st.session_state.wind_speed} km/h from {st.session_state.wind_dir}°")
+# Show current values
+st.sidebar.metric("🌬️ Current wind", f"{st.session_state.wind_speed} km/h from {st.session_state.wind_dir}°")
 st.sidebar.metric("🧭 Your heading", f"{st.session_state.user_heading}° (0=N)")
 
-# ========== Advanced settings ==========
+# ========== Advanced Launcher Settings ==========
 with st.expander("⚙️ Advanced Launcher Settings"):
     pressure_psi = st.slider("Regulated Pressure (PSI)", 35, 70, st.session_state.pressure)
     barrel_type = st.radio("Barrel Type", ["Optimised Helical (Kv = 0.24)", "Standard (Kv = 0.20)"],
@@ -211,30 +220,33 @@ if crosswind_kmh > 0:
 else:
     raw = gyro_drift = offset_m = azimuth_angle = net_d = 0
 
-# ========== Results ==========
+# ========== Main Results ==========
 st.header("🎯 Azimuth Offset (Primary Output)")
 col1, col2, col3 = st.columns([2, 2, 1])
+
 with col1:
     if crosswind_kmh > 0:
         st.metric("🌬️ Crosswind component", f"{crosswind_kmh:.1f} km/h")
         st.metric("🌀 Rotate bipod UPWIND by", f"{azimuth_angle:.1f}°",
                   delta=f"→ cancels {gyro_drift:.2f} m drift", delta_color="normal")
     else:
-        st.success("✅ No crosswind component.")
-        st.metric("Azimuth offset", "0.0°", delta="No rotation needed")
+        st.success("✅ No crosswind component (wind aligned with heading).")
+        st.metric("Azimuth offset", "0.0°", delta="No rotation")
+
 with col2:
-    st.metric("📏 Raw drift", f"{raw:.2f} m" if crosswind_kmh > 0 else "0 m")
+    st.metric("📏 Raw drift (no gyro)", f"{raw:.2f} m" if crosswind_kmh > 0 else "0 m")
     st.metric("⚙️ After gyro (helical barrel)", f"{gyro_drift:.2f} m" if crosswind_kmh > 0 else "0 m")
-    st.metric("🎯 Net drift", f"{net_d:.2f} m", delta="✅ Canceled" if net_d < 0.1 else "⚠️")
+    st.metric("🎯 Final net drift", f"{net_d:.2f} m", delta="✅ Canceled" if net_d < 0.1 else "⚠️")
+
 with col3:
     required_apex = st.session_state.load_height + 0.4
     st.metric("Apex height / Clear load", f"{apex:.2f} m",
               delta="✅ PASS" if apex >= required_apex else "❌ FAIL")
-    st.metric("Horizontal range", f"{range_m:.1f} m",
+    st.metric("Horizontal range / Trailer width", f"{range_m:.1f} m",
               delta="✅ PASS" if range_m >= 2.4 else "❌ FAIL")
 
 if crosswind_kmh > 0:
-    st.info(f"👉 **Operator instruction:** Rotate bipod **{azimuth_angle:.1f} degrees upwind** before launching.")
+    st.info(f"👉 **Operator instruction:** Rotate bipod **{azimuth_angle:.1f} degrees upwind** (toward the wind) before each launch.")
 else:
     st.info("✅ Aim straight across the trailer. No azimuth offset needed.")
 
@@ -286,4 +298,4 @@ if st.button("▶️ Run Mission Check"):
     st.dataframe(df, use_container_width=True)
     st.success(f"Completed {df[df['Success']=='✅'].shape[0]}/{num_straps} straps. Swaps: {swaps}")
 
-st.caption("📱 On phone: tap the green button, allow location, then the page reloads with your GPS coordinates. Wind data is fetched live. Use manual override if needed.")
+st.caption("📍 How it works: Click 'Get My Current Location' – your browser asks for permission – then page reloads with your actual GPS coordinates. Wind is fetched live. If geolocation fails, use Manual Override.")
