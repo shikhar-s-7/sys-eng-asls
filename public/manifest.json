@@ -1,0 +1,24 @@
+{
+  "name": "ASLS Azimuth Offset Planner",
+  "short_name": "ASLS",
+  "description": "GPS-based live wind and azimuth offset calculator for bipod rotation",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0c0f",
+  "theme_color": "#c8f060",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
