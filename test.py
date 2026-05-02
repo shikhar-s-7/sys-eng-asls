@@ -6,10 +6,8 @@ import time
 
 st.set_page_config(page_title="ASLS Global – Azimuth Offset Planner", layout="wide")
 
-st.title("🌍 ASLS Global – Wind‑Based Azimuth Offset Planner")
-st.markdown(
-    "Get the **azimuth offset** (degrees to rotate bipod upwind) for your pneumatic strap launcher."
-)
+st.title("🎯 ASLS Global: Wind‑Based Azimuth Offset Planner")
+st.markdown("Automatically detects your location and live wind data. Works worldwide.")
 
 # ========== Constants ==========
 g = 9.81
@@ -20,23 +18,31 @@ AZIMUTH_OFFSET_COEFF = 0.02425
 REGULATED_PSI = 50
 ANGLE_DEG = 65
 KV = 0.24
+LOAD_HEIGHT_DEFAULT = 4.3
 
-# ========== Helper functions ==========
-def fetch_openmeteo_weather(lat, lon):
+# ========== 1. Weather API (Open‑Meteo) ==========
+@st.cache_data(ttl=600)
+def get_weather(lat, lon):
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
         current = data.get("current_weather", {})
-        wind_speed = current.get("windspeed", 0)
-        wind_direction = current.get("winddirection", 0)
-        return wind_speed, wind_direction
+        wind_speed = current.get("windspeed")
+        wind_dir = current.get("winddirection")
+        if wind_speed is not None and wind_dir is not None:
+            return float(wind_speed), float(wind_dir)
+        else:
+            return None, None
     except Exception as e:
-        st.error(f"Weather fetch error: {e}")
+        st.error(f"Weather API error: {e}")
         return None, None
 
-def get_my_location():
+# ========== 2. IP‑based Geolocation (global, no country filter) ==========
+@st.cache_data(ttl=86400)
+def get_location_from_ip():
+    """Returns city, latitude, longitude from user's IP address (ip-api.com)."""
     try:
         response = requests.get("http://ip-api.com/json/", timeout=10)
         response.raise_for_status()
@@ -44,29 +50,34 @@ def get_my_location():
         if data.get("status") == "success":
             lat = data.get("lat")
             lon = data.get("lon")
-            country = data.get("countryCode")
             city = data.get("city")
-            return lat, lon, country, city
+            country = data.get("country")
+            # Return full location string, lat, lon – no country filter
+            location_name = f"{city}, {country}" if city and country else f"{lat:.3f}, {lon:.3f}"
+            return location_name, lat, lon
+        else:
+            st.warning("IP location service failed. Defaulting to London (global fallback).")
+            return "London, UK", 51.5074, -0.1278
     except Exception:
-        pass
-    return None, None, None, None
+        st.warning("Could not detect location. Using London, UK as fallback.")
+        return "London, UK", 51.5074, -0.1278
 
+# ========== 3. Ballistic performance functions ==========
 def flight_time(v0, theta_deg):
     rad = np.radians(theta_deg)
-    t_up = v0 * np.sin(rad) / g
-    return 2 * t_up
+    return 2 * v0 * np.sin(rad) / g
 
 def raw_lateral_drift(wind_m_s, t_flight):
     return Kd * wind_m_s * t_flight
 
-def net_drift(wind_kmh, t_flight, gyro=True, azimuth_corr=True):
+def net_drift(wind_kmh, t_flight):
+    if wind_kmh <= 0:
+        return 0.0
     wind_m_s = wind_kmh / 3.6
     raw = raw_lateral_drift(wind_m_s, t_flight)
-    after_gyro = raw * GYRO_REDUCTION if gyro else raw
-    if azimuth_corr:
-        offset = AZIMUTH_OFFSET_COEFF * min(wind_kmh, 40)
-        return max(0, after_gyro - offset)
-    return after_gyro
+    after_gyro = raw * GYRO_REDUCTION
+    offset_m = AZIMUTH_OFFSET_COEFF * min(wind_kmh, 40)
+    return max(0, after_gyro - offset_m)
 
 def muzzle_velocity(psi, kv):
     return kv * psi
@@ -75,211 +86,136 @@ def apex_height(v0, theta_deg):
     rad = np.radians(theta_deg)
     return (v0 * np.sin(rad))**2 / (2 * g)
 
-# ========== Session state ==========
-for key in ["wind_speed", "wind_dir", "selected_location", "user_heading"]:
-    if key not in st.session_state:
-        st.session_state[key] = None if key == "user_heading" else (0 if "wind" in key else None)
+def horizontal_range(v0, theta_deg):
+    return (v0**2 * np.sin(2 * np.radians(theta_deg))) / g
 
-# ========== Sidebar – Location ==========
-st.sidebar.header("📍 Choose Your Location")
-location_option = st.sidebar.radio(
-    "Location source",
-    ["Use my current location (global)", "Brisbane", "Adelaide", "Sydney", "Perth"]
-)
+# ========== 4. Session state initialisation ==========
+if "wind_speed" not in st.session_state:
+    st.session_state.wind_speed = 25
+if "wind_dir" not in st.session_state:
+    st.session_state.wind_dir = 90
+if "user_heading" not in st.session_state:
+    st.session_state.user_heading = 0
+if "selected_location" not in st.session_state:
+    st.session_state.selected_location = "Not set"
+if "pressure" not in st.session_state:
+    st.session_state.pressure = REGULATED_PSI
+if "barrel" not in st.session_state:
+    st.session_state.barrel = "Optimised Helical (Kv = 0.24)"
+if "angle" not in st.session_state:
+    st.session_state.angle = ANGLE_DEG
+if "rain" not in st.session_state:
+    st.session_state.rain = False
+if "load_height" not in st.session_state:
+    st.session_state.load_height = LOAD_HEIGHT_DEFAULT
 
-city_coords = {
-    "Brisbane": (-27.4679, 153.0281),
-    "Adelaide": (-34.9287, 138.5986),
-    "Sydney": (-33.8651, 151.2099),
-    "Perth": (-31.9505, 115.8605)
-}
+# ========== 5. Sidebar – Auto location & manual override ==========
+st.sidebar.header("📍 Location & Wind")
 
-if location_option == "Use my current location (global)":
-    with st.spinner("Detecting your location ..."):
-        lat, lon, country, city = get_my_location()
-    if lat is not None:
-        location_name = f"{city or 'Your location'}, {country or 'Unknown'}"
-        st.session_state.selected_location = location_name
-        with st.spinner(f"Fetching live wind data for {city or 'your area'} ..."):
-            wind_speed, wind_dir = fetch_openmeteo_weather(lat, lon)
-        if wind_speed is not None:
-            st.session_state.wind_speed = wind_speed
-            st.session_state.wind_dir = wind_dir
-            st.sidebar.success(f"✅ {location_name}: {wind_speed:.1f} km/h, dir {wind_dir:.0f}°")
+auto_button = st.sidebar.button("🌐 Auto‑detect my location & weather")
+if auto_button:
+    with st.spinner("Detecting your location and fetching weather..."):
+        loc_name, lat, lon = get_location_from_ip()
+        st.session_state.selected_location = loc_name
+        speed, direction = get_weather(lat, lon)
+        if speed is not None:
+            st.session_state.wind_speed = speed
+            st.session_state.wind_dir = direction
+            st.sidebar.success(f"📍 Location: {loc_name}")
+            st.sidebar.success(f"🌬️ Wind: {speed} km/h from {direction}°")
         else:
-            st.sidebar.error("Weather fetch failed. Using manual override mode.")
-            st.session_state.wind_speed = 0
-            st.session_state.wind_dir = 0
-    else:
-        st.sidebar.error("Could not detect location. Choose a city or use manual wind.")
-        st.session_state.wind_speed = 0
-        st.session_state.wind_dir = 0
-elif location_option in city_coords:
-    lat, lon = city_coords[location_option]
-    st.session_state.selected_location = location_option
-    with st.spinner(f"Fetching live wind data for {location_option} ..."):
-        wind_speed, wind_dir = fetch_openmeteo_weather(lat, lon)
-    if wind_speed is not None:
-        st.session_state.wind_speed = wind_speed
-        st.session_state.wind_dir = wind_dir
-        st.sidebar.success(f"✅ {location_option}: {wind_speed:.1f} km/h, dir {wind_dir:.0f}°")
-    else:
-        st.sidebar.error("Weather fetch failed. Using manual override mode.")
-        st.session_state.wind_speed = 0
-        st.session_state.wind_dir = 0
+            st.sidebar.error("Could not fetch weather – using previous wind values or manual override.")
 
-# ========== Manual wind override (for testing) ==========
-st.sidebar.divider()
-st.sidebar.subheader("🌬️ Manual Wind Override")
-use_manual_wind = st.sidebar.checkbox("Override with manual wind values", value=False)
-if use_manual_wind:
-    manual_speed = st.sidebar.number_input("Manual wind speed (km/h)", 0, 100, 25)
-    manual_dir = st.sidebar.number_input("Manual wind direction (degrees)", 0, 360, 90)
-    st.session_state.wind_speed = manual_speed
-    st.session_state.wind_dir = manual_dir
-    st.sidebar.info(f"Using manual wind: {manual_speed} km/h from {manual_dir}°")
-
-# Display current wind values for debugging
-st.sidebar.write(f"🌬️ **Current wind:** {st.session_state.wind_speed} km/h, direction {st.session_state.wind_dir}°")
-
-# ========== Compass / Heading Input ==========
-st.sidebar.subheader("🧭 Your Facing Direction")
-
-compass_html = """
-<div style="text-align:center; padding:10px;">
-    <div id="compass-heading" style="font-size:2rem; font-weight:bold;">--°</div>
-    <div id="compass-status" style="font-size:0.8rem; color:gray;"></div>
-    <button id="compass-btn" style="margin-top:8px; padding:6px 12px;">Request Compass Permission</button>
-</div>
-<script>
-    const headingDiv = document.getElementById('compass-heading');
-    const statusDiv = document.getElementById('compass-status');
-    const btn = document.getElementById('compass-btn');
-
-    function updateHeading(value) {
-        let h = Math.round(value);
-        headingDiv.innerText = h + '°';
-        statusDiv.innerText = 'Heading updated. Enter this value below.';
-        sessionStorage.setItem('asls_heading', h);
-    }
-
-    function handleOrientation(event) {
-        let alpha = event.alpha;
-        let compassHeading = event.webkitCompassHeading || alpha;
-        if (compassHeading !== null && compassHeading !== undefined) {
-            updateHeading(compassHeading);
-        } else {
-            statusDiv.innerText = 'Waiting for sensor...';
-        }
-    }
-
-    if (window.DeviceOrientationEvent) {
-        if (typeof DeviceOrientationEvent.requestPermission === 'function') {
-            btn.style.display = 'inline-block';
-            btn.onclick = async () => {
-                try {
-                    const perm = await DeviceOrientationEvent.requestPermission();
-                    if (perm === 'granted') {
-                        window.addEventListener('deviceorientation', handleOrientation);
-                        btn.style.display = 'none';
-                        statusDiv.innerText = 'Permission granted. Move device slightly.';
-                    } else {
-                        statusDiv.innerText = 'Permission denied. Use manual input.';
-                    }
-                } catch(e) {
-                    statusDiv.innerText = 'Error requesting permission.';
-                }
-            };
-        } else {
-            window.addEventListener('deviceorientation', handleOrientation);
-            btn.style.display = 'none';
-            statusDiv.innerText = 'Compass active – move device.';
-        }
-    } else {
-        statusDiv.innerText = 'Compass not supported. Use manual input.';
-        btn.style.display = 'none';
-        headingDiv.innerText = 'N/A';
-    }
-</script>
-"""
-
-with st.sidebar:
-    st.components.v1.html(compass_html, height=180)
-    st.caption("On phones, tap the button and allow permission. Then copy the heading below.")
-
-manual_heading = st.sidebar.number_input(
-    "👉 Enter your facing direction (degrees, 0‑360)",
-    min_value=0, max_value=360, value=0, step=1,
-    help="0° = North, 90° = East, 180° = South, 270° = West."
-)
-st.session_state.user_heading = manual_heading
-st.sidebar.write(f"🧭 **Your heading:** {st.session_state.user_heading}°")
-
-# ========== Advanced Settings ==========
-with st.expander("⚙️ Advanced Settings (override defaults)"):
-    pressure_psi = st.slider("Regulated Pressure (PSI)", 35, 70, REGULATED_PSI)
-    barrel_type = st.radio("Barrel Type", ["Optimised Helical (Kv = 0.24)", "Standard (Kv = 0.20)"])
-    kv = 0.24 if "Optimised" in barrel_type else 0.20
-    angle_deg = st.slider("Launch Angle (degrees)", 55, 75, ANGLE_DEG)
-    rain = st.checkbox("Rain (2% velocity penalty)")
-    load_height = st.number_input("Load Height (m)", 3.0, 6.0, 4.3, step=0.1)
-
-# ========== Crosswind & Azimuth Offset ==========
-# Ensure we have numbers
-wind_speed = st.session_state.wind_speed if st.session_state.wind_speed is not None else 0
-wind_dir = st.session_state.wind_dir if st.session_state.wind_dir is not None else 0
-heading = st.session_state.user_heading if st.session_state.user_heading is not None else 0
-
-if wind_speed > 0:
-    rel_angle_rad = np.radians(wind_dir - heading)
-    crosswind_kmh = abs(wind_speed * np.sin(rel_angle_rad))
+st.sidebar.markdown("---")
+st.sidebar.subheader("✍️ Manual Override")
+use_manual = st.sidebar.checkbox("Use manual values", value=False)
+if use_manual:
+    manual_city = st.sidebar.text_input("City (label only)", "Anywhere")
+    manual_wind_speed = st.sidebar.number_input("Manual wind speed (km/h)", 0, 100, 25)
+    manual_wind_dir = st.sidebar.number_input("Manual wind direction (deg)", 0, 360, 90)
+    manual_heading = st.sidebar.number_input("Your heading (deg, 0=N)", 0, 360, 0)
+    st.session_state.wind_speed = manual_wind_speed
+    st.session_state.wind_dir = manual_wind_dir
+    st.session_state.user_heading = manual_heading
+    st.session_state.selected_location = f"Manual: {manual_city}"
 else:
-    crosswind_kmh = 0
+    # If manual is off, keep whatever was set by auto or earlier
+    pass
 
-v0 = muzzle_velocity(pressure_psi, kv)
-if rain:
+# Show current settings
+st.sidebar.metric("📍 Location", st.session_state.selected_location)
+st.sidebar.metric("🌬️ Wind used", f"{st.session_state.wind_speed} km/h from {st.session_state.wind_dir}°")
+st.sidebar.metric("🧭 Your heading", f"{st.session_state.user_heading}° (0=N)")
+
+# ========== 6. Advanced settings ==========
+with st.expander("⚙️ Advanced Launcher Settings"):
+    pressure_psi = st.slider("Regulated Pressure (PSI)", 35, 70, st.session_state.pressure)
+    barrel_type = st.radio("Barrel Type", ["Optimised Helical (Kv = 0.24)", "Standard (Kv = 0.20)"],
+                           index=0 if st.session_state.barrel == "Optimised Helical (Kv = 0.24)" else 1)
+    angle_deg = st.slider("Launch Angle (degrees)", 55, 75, st.session_state.angle)
+    rain = st.checkbox("Rain (2% velocity penalty)", st.session_state.rain)
+    load_height = st.number_input("Load Height (m)", 3.0, 6.0, st.session_state.load_height, 0.1)
+    # Update session state
+    st.session_state.pressure = pressure_psi
+    st.session_state.barrel = barrel_type
+    st.session_state.angle = angle_deg
+    st.session_state.rain = rain
+    st.session_state.load_height = load_height
+
+kv = 0.24 if "Optimised" in st.session_state.barrel else 0.20
+
+# ========== 7. Crosswind & azimuth calculation ==========
+wind_speed = st.session_state.wind_speed
+wind_dir = st.session_state.wind_dir
+heading = st.session_state.user_heading
+
+rel_rad = np.radians(wind_dir - heading)
+crosswind_kmh = abs(wind_speed * np.sin(rel_rad))
+
+v0 = muzzle_velocity(st.session_state.pressure, kv)
+if st.session_state.rain:
     v0 *= 0.98
-t_flight = flight_time(v0, angle_deg)
-apex = apex_height(v0, angle_deg)
-range_m = v0**2 * np.sin(2 * np.radians(angle_deg)) / g
+t_flight = flight_time(v0, st.session_state.angle)
+apex = apex_height(v0, st.session_state.angle)
+range_m = horizontal_range(v0, st.session_state.angle)
 
 if crosswind_kmh > 0:
     raw = raw_lateral_drift(crosswind_kmh / 3.6, t_flight)
     gyro_drift = raw * GYRO_REDUCTION
-    azimuth_offset_m = AZIMUTH_OFFSET_COEFF * min(crosswind_kmh, 40)
-    azimuth_angle_deg = np.degrees(np.arctan(azimuth_offset_m / DISTANCE_TO_FAR_SIDE))
-    net_drift_val = max(0, gyro_drift - azimuth_offset_m)
+    offset_m = AZIMUTH_OFFSET_COEFF * min(crosswind_kmh, 40)
+    azimuth_angle = np.degrees(np.arctan(offset_m / DISTANCE_TO_FAR_SIDE))
+    net_d = max(0, gyro_drift - offset_m)
 else:
-    raw = gyro_drift = azimuth_offset_m = azimuth_angle_deg = net_drift_val = 0
+    raw = gyro_drift = offset_m = azimuth_angle = net_d = 0
 
-# ========== Main Output ==========
-st.header("🎯 Azimuth Offset (Main Result)")
+# ========== 8. Main results ==========
+st.header("🎯 Azimuth Offset (Primary Output)")
 col1, col2, col3 = st.columns([2, 2, 1])
 with col1:
     if crosswind_kmh > 0:
-        st.metric("🌬️ Crosswind Component", f"{crosswind_kmh:.1f} km/h")
-        st.metric("🌀 Rotate Bipod UPWIND by", f"{azimuth_angle_deg:.1f}°",
-                  delta=f"→ Compensates {gyro_drift:.2f} m drift", delta_color="normal")
+        st.metric("🌬️ Crosswind component", f"{crosswind_kmh:.1f} km/h")
+        st.metric("🌀 Rotate bipod UPWIND by", f"{azimuth_angle:.1f}°",
+                  delta=f"→ cancels {gyro_drift:.2f} m drift", delta_color="normal")
     else:
-        st.warning("No crosswind component detected (wind speed zero, wind aligned, or heading default).\n\nIf this is unexpected, use **Manual Wind Override** in the sidebar to set wind speed/direction and try again.")
-        st.metric("🌀 Azimuth Offset", "0°", delta="No correction needed")
+        st.success("✅ No crosswind component (wind aligned with your heading).")
+        st.metric("Azimuth offset", "0.0°", delta="No rotation needed")
 with col2:
-    st.metric("📏 Raw Lateral Drift", f"{raw:.2f} m" if crosswind_kmh > 0 else "0 m")
-    st.metric("⚙️ After Gyro (-35%)", f"{gyro_drift:.2f} m" if crosswind_kmh > 0 else "0 m")
-    st.metric("🎯 Net Drift", f"{net_drift_val:.2f} m", 
-              delta="✅ Cancelled" if net_drift_val < 0.1 else "⚠️ Residual")
+    st.metric("📏 Raw drift (no gyro)", f"{raw:.2f} m" if crosswind_kmh > 0 else "0 m")
+    st.metric("⚙️ After gyro stabilisation", f"{gyro_drift:.2f} m" if crosswind_kmh > 0 else "0 m")
+    st.metric("🎯 Net drift", f"{net_d:.2f} m", delta="✅ Canceled" if net_d < 0.1 else "⚠️")
 with col3:
-    st.metric("Apex Height", f"{apex:.2f} m", 
-              delta="PASS" if apex >= load_height + 0.4 else "FAIL")
-    st.metric("Horizontal Range", f"{range_m:.1f} m",
-              delta="PASS" if range_m >= 2.4 else "FAIL")
+    required_apex = st.session_state.load_height + 0.4
+    st.metric("Apex height / Load clearance", f"{apex:.2f} m",
+              delta="✅ PASS" if apex >= required_apex else "❌ FAIL")
+    st.metric("Horizontal range / Trailer width", f"{range_m:.1f} m",
+              delta="✅ PASS" if range_m >= 2.4 else "❌ FAIL")
 
 if crosswind_kmh > 0:
-    st.success(f"**👉 Instruction:** Rotate the bipod **{azimuth_angle_deg:.1f} degrees upwind** before launching.")
+    st.info(f"👉 **Operator instruction:** Rotate the bipod **{azimuth_angle:.1f} degrees upwind** (toward the wind) before each launch. This cancels the crosswind drift.")
 else:
-    st.info("✅ No crosswind component – aim straight across the trailer.\n\nIf you expected wind, check the **Manual Wind Override** checkbox in the sidebar and set typical values (e.g., 25 km/h from 90°).")
+    st.info("✅ Aim straight across the trailer. No azimuth offset needed.")
 
-# ========== Mission Simulation ==========
+# ========== 9. Optional load simulation ==========
 st.divider()
 st.subheader("📋 Full Load Mission Check (optional)")
 num_straps = st.slider("Number of straps", 6, 13, 10)
@@ -291,31 +227,31 @@ if st.button("▶️ Run Mission Check"):
     progress = st.progress(0)
     status = st.empty()
     for i in range(1, num_straps + 1):
-        reg = pressure_psi if cylinder >= pressure_psi else cylinder
+        reg = st.session_state.pressure if cylinder >= st.session_state.pressure else cylinder
         if reg < 46:
-            status.warning(f"Strap {i}: low pressure ({reg:.0f} PSI). Swapping cylinder...")
+            status.warning(f"Strap {i}: low pressure ({reg:.0f} PSI). Swapping...")
             time.sleep(0.3)
             cylinder = 60.0
-            reg = pressure_psi
+            reg = st.session_state.pressure
             swaps += 1
             status.info("Cylinder swapped.")
             time.sleep(0.3)
         v = muzzle_velocity(reg, kv)
-        if rain:
+        if st.session_state.rain:
             v *= 0.98
-        a = apex_height(v, angle_deg)
-        r = v**2 * np.sin(2 * np.radians(angle_deg)) / g
-        t = flight_time(v, angle_deg)
+        a = apex_height(v, st.session_state.angle)
+        r = horizontal_range(v, st.session_state.angle)
+        t = flight_time(v, st.session_state.angle)
         d = net_drift(crosswind_kmh, t)
-        apex_ok = a >= load_height + 0.4
+        apex_ok = a >= st.session_state.load_height + 0.4
         success = apex_ok and (d < 0.3 or crosswind_kmh == 0)
         rows.append({
             "Strap": i,
             "Reg (PSI)": f"{reg:.0f}",
-            "v₀ (m/s)": f"{v:.1f}",
+            "v₀": f"{v:.1f}",
             "Apex (m)": f"{a:.2f}",
             "Range (m)": f"{r:.1f}",
-            "Net Drift (m)": f"{d:.2f}",
+            "Drift (m)": f"{d:.2f}",
             "Success": "✅" if success else "❌"
         })
         progress.progress(i / num_straps)
@@ -325,6 +261,6 @@ if st.button("▶️ Run Mission Check"):
             cylinder = max(35, cylinder - drop_per_shot)
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True)
-    st.success(f"**Completed {df[df['Success']=='✅'].shape[0]}/{num_straps} straps.** Cylinder swaps: {swaps}")
+    st.success(f"Completed {df[df['Success']=='✅'].shape[0]}/{num_straps} straps. Cylinder swaps: {swaps}")
 
-st.caption("Use the **Manual Wind Override** in the sidebar if live weather fails. Then adjust your heading and see the azimuth offset update.")
+st.caption("Data sources: Open‑Meteo (weather), ip-api.com (IP‑based geolocation). Works globally – no country restrictions.")
