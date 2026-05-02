@@ -9,6 +9,33 @@ st.set_page_config(page_title="ASLS Global – Azimuth Offset Planner", layout="
 st.title("🎯 ASLS Global: Wind‑Based Azimuth Offset Planner")
 st.markdown("Automatically detects your location and live wind data. Works worldwide.")
 
+# ===== Client-side geolocation handling =====
+# Prefer explicit `lat`/`lon` in the page URL provided by the browser
+# (the client-side button navigates the top window to add these).
+# Use `st.query_params` (available in this Streamlit version) and mark
+# the parameters as processed in `st.session_state` so we don't repeat work.
+params = st.query_params
+if "processed_query_coords" not in st.session_state:
+    st.session_state.processed_query_coords = False
+if (not st.session_state.processed_query_coords) and ("lat" in params and "lon" in params):
+    try:
+        lat = float(params["lat"][0])
+        lon = float(params["lon"][0])
+        st.session_state.selected_location = "Your device"
+        with st.spinner("Fetching weather for your device location..."):
+            speed, direction = get_weather(lat, lon)
+        if speed is not None:
+            st.session_state.wind_speed = speed
+            st.session_state.wind_dir = direction
+            st.sidebar.success(f"📍 Device location: {lat:.4f}, {lon:.4f}")
+            st.sidebar.success(f"🌬️ Wind: {speed:.1f} km/h from {direction:.0f}°")
+        else:
+            st.sidebar.warning("Weather fetch failed for device location.")
+    except Exception as e:
+        st.sidebar.error(f"Invalid coordinates: {e}")
+    finally:
+        st.session_state.processed_query_coords = True
+
 # ========== Constants ==========
 g = 9.81
 DISTANCE_TO_FAR_SIDE = 7.0
@@ -112,7 +139,34 @@ if "load_height" not in st.session_state:
 # ========== 5. Sidebar – Auto location & manual override ==========
 st.sidebar.header("📍 Location & Wind")
 
-auto_button = st.sidebar.button("🌐 Auto‑detect my location & weather")
+# Client-side button: requests browser geolocation and navigates top window
+with st.sidebar:
+        geo_html = """
+        <div style="text-align:center; padding:6px 0;">
+            <button id="get-location" style="padding:8px 12px; font-size:0.95rem;">📍 Use my device location</button>
+            <div id="geo-status" style="font-size:0.85rem; margin-top:6px;"></div>
+        </div>
+        <script>
+            const btn = document.getElementById('get-location');
+            const status = document.getElementById('geo-status');
+            btn.onclick = () => {
+                if (!navigator.geolocation) { status.innerText = 'Geolocation not supported by this browser.'; return; }
+                status.innerText = 'Requesting permission...';
+                navigator.geolocation.getCurrentPosition(function(position) {
+                    const lat = position.coords.latitude;
+                    const lon = position.coords.longitude;
+                    const url = new URL(window.location.href);
+                    url.searchParams.set('lat', lat);
+                    url.searchParams.set('lon', lon);
+                    // Navigate the top-level window so the request originates from the user's browser
+                    try { window.top.location.href = url.toString(); } catch(e) { window.location.href = url.toString(); }
+                }, function(err) { status.innerText = 'Error: ' + err.message; }, { enableHighAccuracy: true, timeout: 10000 });
+            };
+        </script>
+        """
+        st.components.v1.html(geo_html, height=130)
+
+auto_button = st.sidebar.button("🌐 Auto‑detect my location & weather (IP‑based fallback)")
 if auto_button:
     with st.spinner("Detecting your location and fetching weather..."):
         loc_name, lat, lon = get_location_from_ip()
