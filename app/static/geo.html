@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Share location with ASLS app</title>
+  <style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;margin:1rem}button{padding:10px 14px;border-radius:6px;border:0;background:#0b73ff;color:#fff;font-size:1rem;cursor:pointer}</style>
+</head>
+<body>
+  <h2>Share your location</h2>
+  <p>This page will request your device's GPS coordinates and send them back to the ASLS app.</p>
+  <p><button id="share">📍 Share my location</button></p>
+  <p id="status" style="color:#555"></p>
+
+  <script>
+    function setStatus(s){document.getElementById('status').innerText = s}
+    function sendCoords(lat, lon){
+      const q = '?lat=' + encodeURIComponent(lat) + '&lon=' + encodeURIComponent(lon);
+      // Try to update the opener (the original app tab) if available
+      if(window.opener && !window.opener.closed){
+        try{
+          const base = window.opener.location.href.split('?')[0];
+          window.opener.location.href = base + q;
+          window.close();
+          return;
+        }catch(e){
+          // cross-origin or blocked; fallthrough to top-level redirect
+        }
+      }
+      // Fallback: navigate this tab to the app root
+      try{
+        const origin = window.location.origin;
+        window.location.href = origin + '/' + q;
+      }catch(e){
+        // as last resort, just append to path
+        window.location.href = '/' + q;
+      }
+    }
+
+    document.getElementById('share').addEventListener('click', function(){
+      if(!navigator.geolocation){ setStatus('Geolocation not supported by this browser.'); return; }
+      setStatus('Requesting permission...');
+      navigator.geolocation.getCurrentPosition(function(pos){
+        setStatus('Location obtained — returning to app...');
+        sendCoords(pos.coords.latitude, pos.coords.longitude);
+      }, function(err){
+        setStatus('Error: ' + err.message + '. Try enabling location and reloading this page.');
+      }, { enableHighAccuracy: true, timeout: 15000 });
+    });
+  </script>
+</body>
+</html>
