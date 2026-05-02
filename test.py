@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import requests
 import time
-from urllib.parse import urlencode
 
 st.set_page_config(page_title="ASLS – Azimuth Offset Planner", layout="wide")
 
@@ -74,10 +73,9 @@ if "lat" in query_params and "lon" in query_params:
     try:
         lat = float(query_params["lat"])
         lon = float(query_params["lon"])
-        # Store in session state
         st.session_state.user_lat = lat
         st.session_state.user_lon = lon
-        # Clear params to avoid re-processing
+        # Clear params to avoid re-processing on next run
         st.query_params.clear()
         # Fetch weather for these coordinates
         with st.spinner("Fetching live wind data for your location..."):
@@ -86,12 +84,12 @@ if "lat" in query_params and "lon" in query_params:
                 st.session_state.wind_speed = speed
                 st.session_state.wind_dir = direction
                 st.session_state.location_fetched = True
-                st.success(f"Location detected! Wind: {speed} km/h from {direction}°")
+                st.success(f"✅ Location detected! Wind: {speed} km/h from {direction}°")
             else:
                 st.warning("Weather data not available for these coordinates.")
                 st.session_state.location_fetched = False
-    except:
-        pass
+    except Exception as e:
+        st.error(f"Error processing coordinates: {e}")
 
 # ========== Session state initialisation ==========
 if "wind_speed" not in st.session_state:
@@ -120,49 +118,131 @@ if "load_height" not in st.session_state:
 # ========== Sidebar: Location and Wind ==========
 st.sidebar.header("📍 Location & Wind")
 
-# HTML/JS geolocation button (no extra package)
+# Hidden input that JS will write coordinates into
+coords_raw = st.sidebar.text_input(
+    "GPS Coordinates (auto-filled)",
+    key="gps_coords",
+    label_visibility="collapsed",
+    placeholder="waiting for GPS…",
+)
+
+# Process coordinates if JS has written them
+if coords_raw and "," in coords_raw:
+    try:
+        lat_str, lon_str = coords_raw.strip().split(",", 1)
+        lat, lon = float(lat_str), float(lon_str)
+        if st.session_state.user_lat != lat or st.session_state.user_lon != lon:
+            st.session_state.user_lat = lat
+            st.session_state.user_lon = lon
+            with st.spinner("Fetching live wind data…"):
+                speed, direction = get_weather(lat, lon)
+            if speed is not None:
+                st.session_state.wind_speed = speed
+                st.session_state.wind_dir = direction
+                st.session_state.location_fetched = True
+                st.sidebar.success(f"✅ Wind: {speed} km/h from {direction}°")
+            else:
+                st.sidebar.warning("Weather data unavailable for these coordinates.")
+    except Exception as e:
+        st.sidebar.error(f"Could not parse coordinates: {e}")
+
+# Geolocation button — JS fills the hidden input directly (no page reload)
 geo_html = """
-<div id="geo-status" style="margin-bottom: 10px; font-size:0.9rem; color: #888;"></div>
-<button id="geo-btn" style="padding: 8px 16px; background-color: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer;">📍 Get My Current Location (GPS)</button>
+<div id="geo-status" style="margin-bottom:8px;font-size:0.85rem;font-weight:500;color:#ccc;min-height:20px;"></div>
+<button id="geo-btn"
+  style="padding:10px 20px;background:#0066cc;color:white;border:none;border-radius:4px;cursor:pointer;width:100%;font-size:0.9rem;">
+  📍 Use My Current Location (GPS)
+</button>
 <script>
-    const btn = document.getElementById('geo-btn');
-    const statusDiv = document.getElementById('geo-status');
-    btn.onclick = () => {
-        if (!navigator.geolocation) {
-            statusDiv.innerHTML = "Geolocation not supported by this browser.";
-            return;
-        }
-        statusDiv.innerHTML = "Requesting permission...";
-        navigator.geolocation.getCurrentPosition(
-            (position) => {
-                const lat = position.coords.latitude;
-                const lon = position.coords.longitude;
-                statusDiv.innerHTML = "Location obtained. Reloading...";
-                const url = new URL(window.location.href);
-                url.searchParams.set('lat', lat);
-                url.searchParams.set('lon', lon);
-                window.location.href = url.toString();
-            },
-            (error) => {
-                statusDiv.innerHTML = "Error: " + error.message + ". Try allowing location in browser settings.";
-            }
-        );
-    };
+(function() {
+  const btn    = document.getElementById('geo-btn');
+  const status = document.getElementById('geo-status');
+
+  function setStreamlitInput(value) {
+    // Walk up to the Streamlit parent document and find our hidden input
+    const doc = window.parent.document;
+    // The input rendered by st.text_input with key="gps_coords"
+    const inputs = doc.querySelectorAll('input[type="text"]');
+    let target = null;
+    for (const inp of inputs) {
+      if (inp.placeholder === 'waiting for GPS…') { target = inp; break; }
+    }
+    if (!target) {
+      status.innerHTML = '❌ Could not find coordinate input. Please refresh and try again.';
+      return;
+    }
+    // Set value and fire React synthetic events so Streamlit picks up the change
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value'
+    ).set;
+    nativeInputValueSetter.call(target, value);
+    target.dispatchEvent(new Event('input',  { bubbles: true }));
+    target.dispatchEvent(new Event('change', { bubbles: true }));
+    status.innerHTML = '✅ Coordinates sent. Fetching weather…';
+  }
+
+  btn.onclick = function() {
+    if (!navigator.geolocation) {
+      status.innerHTML = '❌ Geolocation not supported by this browser.';
+      return;
+    }
+    btn.disabled = true;
+    status.innerHTML = '⏳ Requesting GPS permission…';
+    navigator.geolocation.getCurrentPosition(
+      function(pos) {
+        const lat = pos.coords.latitude.toFixed(6);
+        const lon = pos.coords.longitude.toFixed(6);
+        status.innerHTML = `📍 Got location: ${lat}, ${lon}`;
+        setStreamlitInput(lat + ',' + lon);
+        btn.disabled = false;
+      },
+      function(err) {
+        const msgs = {
+          1: 'Permission denied — allow location in browser settings.',
+          2: 'Position unavailable — move outdoors or enable GPS.',
+          3: 'Request timed out — try again.',
+        };
+        status.innerHTML = '❌ ' + (msgs[err.code] || err.message);
+        btn.disabled = false;
+      },
+      { timeout: 12000, enableHighAccuracy: true }
+    );
+  };
+})();
 </script>
 """
 with st.sidebar:
-    st.components.v1.html(geo_html, height=100)
-    st.caption("Click the button, allow location, then the page reloads with your coordinates.")
+    st.components.v1.html(geo_html, height=140)
+    st.caption("📱 Click the button, allow GPS. No page reload needed.")
 
+# Show current location status
 if st.session_state.user_lat:
-    st.sidebar.success(f"✅ Coordinates: {st.session_state.user_lat:.3f}, {st.session_state.user_lon:.3f}")
-    st.sidebar.metric("🌬️ Wind used", f"{st.session_state.wind_speed} km/h from {st.session_state.wind_dir}°")
+    st.sidebar.success(f"📍 {st.session_state.user_lat:.4f}, {st.session_state.user_lon:.4f}")
 else:
-    st.sidebar.info("No location yet. Click the button above (on phone, allow GPS).")
+    st.sidebar.info("No location yet. Click the button above.")
 
+# Manual coordinates entry (fallback)
 st.sidebar.markdown("---")
-st.sidebar.subheader("✍️ Manual Override")
-use_manual = st.sidebar.checkbox("Enter wind/heading manually", value=False)
+st.sidebar.subheader("✍️ Manual Coordinates (Fallback)")
+manual_lat = st.sidebar.number_input("Latitude", -90.0, 90.0, -27.4679, step=0.01, format="%.4f")
+manual_lon = st.sidebar.number_input("Longitude", -180.0, 180.0, 153.0281, step=0.01, format="%.4f")
+if st.sidebar.button("Set Manual Location & Fetch Weather"):
+    with st.spinner("Fetching weather for manual coordinates..."):
+        speed, direction = get_weather(manual_lat, manual_lon)
+        if speed is not None:
+            st.session_state.wind_speed = speed
+            st.session_state.wind_dir = direction
+            st.session_state.user_lat = manual_lat
+            st.session_state.user_lon = manual_lon
+            st.session_state.location_fetched = True
+            st.sidebar.success(f"Manually set wind: {speed} km/h from {direction}°")
+        else:
+            st.sidebar.error("Could not fetch weather for these coordinates.")
+
+# Manual wind/heading override (always works)
+st.sidebar.markdown("---")
+st.sidebar.subheader("🌬️ Manual Wind Override (for testing)")
+use_manual = st.sidebar.checkbox("Override wind/heading values", value=False)
 if use_manual:
     manual_speed = st.sidebar.number_input("Wind speed (km/h)", 0, 100, st.session_state.wind_speed)
     manual_dir = st.sidebar.number_input("Wind direction (deg)", 0, 360, st.session_state.wind_dir)
@@ -170,14 +250,14 @@ if use_manual:
     st.session_state.wind_speed = manual_speed
     st.session_state.wind_dir = manual_dir
     st.session_state.user_heading = manual_heading
-    st.session_state.location_fetched = True   # treat as ready
-else:
-    # If manual not active and we have a location, keep that; if no location, keep default values
-    pass
+    st.sidebar.info("Using manual values (override active).")
 
-# Show current values
-st.sidebar.metric("🌬️ Current wind", f"{st.session_state.wind_speed} km/h from {st.session_state.wind_dir}°")
-st.sidebar.metric("🧭 Your heading", f"{st.session_state.user_heading}° (0=N)")
+# Display current wind and heading (where they come from)
+st.sidebar.markdown("---")
+st.sidebar.metric("🌬️ Current wind", f"{st.session_state.wind_speed} km/h from {st.session_state.wind_dir}°",
+                  help="From GPS+weather or manual override")
+st.sidebar.metric("🧭 Your heading", f"{st.session_state.user_heading}° (0=N)",
+                  help="Enter below or use manual override")
 
 # ========== Advanced Launcher Settings ==========
 with st.expander("⚙️ Advanced Launcher Settings"):
@@ -221,7 +301,7 @@ else:
     raw = gyro_drift = offset_m = azimuth_angle = net_d = 0
 
 # ========== Main Results ==========
-st.header("🎯 Azimuth Offset (Primary Output)")
+st.header("🎯 Azimuth Offset (Primary Result)")
 col1, col2, col3 = st.columns([2, 2, 1])
 
 with col1:
@@ -298,4 +378,4 @@ if st.button("▶️ Run Mission Check"):
     st.dataframe(df, use_container_width=True)
     st.success(f"Completed {df[df['Success']=='✅'].shape[0]}/{num_straps} straps. Swaps: {swaps}")
 
-st.caption("📍 How it works: Click 'Get My Current Location' – your browser asks for permission – then page reloads with your actual GPS coordinates. Wind is fetched live. If geolocation fails, use Manual Override.")
+st.caption("📍 **How it works:** Click 'Use My Current Location' – your browser asks permission – page reloads with your actual GPS coordinates (works on phone or laptop). Then weather is fetched live. If geolocation still fails, use the **Manual Coordinates** or **Manual Wind Override** sections – they always work.")
