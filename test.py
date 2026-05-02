@@ -4,37 +4,10 @@ import numpy as np
 import requests
 import time
 
-st.set_page_config(page_title="ASLS Global – Azimuth Offset Planner", layout="wide")
+st.set_page_config(page_title="ASLS – Azimuth Offset Planner", layout="wide")
 
-st.title("🎯 ASLS Global: Wind‑Based Azimuth Offset Planner")
-st.markdown("Automatically detects your location and live wind data. Works worldwide.")
-
-# ===== Client-side geolocation handling =====
-# Prefer explicit `lat`/`lon` in the page URL provided by the browser
-# (the client-side button navigates the top window to add these).
-# Use `st.query_params` (available in this Streamlit version) and mark
-# the parameters as processed in `st.session_state` so we don't repeat work.
-params = st.query_params
-if "processed_query_coords" not in st.session_state:
-    st.session_state.processed_query_coords = False
-if (not st.session_state.processed_query_coords) and ("lat" in params and "lon" in params):
-    try:
-        lat = float(params["lat"][0])
-        lon = float(params["lon"][0])
-        st.session_state.selected_location = "Your device"
-        with st.spinner("Fetching weather for your device location..."):
-            speed, direction = get_weather(lat, lon)
-        if speed is not None:
-            st.session_state.wind_speed = speed
-            st.session_state.wind_dir = direction
-            st.sidebar.success(f"📍 Device location: {lat:.4f}, {lon:.4f}")
-            st.sidebar.success(f"🌬️ Wind: {speed:.1f} km/h from {direction:.0f}°")
-        else:
-            st.sidebar.warning("Weather fetch failed for device location.")
-    except Exception as e:
-        st.sidebar.error(f"Invalid coordinates: {e}")
-    finally:
-        st.session_state.processed_query_coords = True
+st.title("🎯 ASLS Azimuth Offset Planner")
+st.markdown("Click the button below to use your device's actual location (GPS). Works worldwide.")
 
 # ========== Constants ==========
 g = 9.81
@@ -47,7 +20,7 @@ ANGLE_DEG = 65
 KV = 0.24
 LOAD_HEIGHT_DEFAULT = 4.3
 
-# ========== 1. Weather API (Open‑Meteo) ==========
+# ========== Weather API ==========
 @st.cache_data(ttl=600)
 def get_weather(lat, lon):
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
@@ -60,36 +33,12 @@ def get_weather(lat, lon):
         wind_dir = current.get("winddirection")
         if wind_speed is not None and wind_dir is not None:
             return float(wind_speed), float(wind_dir)
-        else:
-            return None, None
+        return None, None
     except Exception as e:
         st.error(f"Weather API error: {e}")
         return None, None
 
-# ========== 2. IP‑based Geolocation (global, no country filter) ==========
-@st.cache_data(ttl=86400)
-def get_location_from_ip():
-    """Returns city, latitude, longitude from user's IP address (ip-api.com)."""
-    try:
-        response = requests.get("http://ip-api.com/json/", timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("status") == "success":
-            lat = data.get("lat")
-            lon = data.get("lon")
-            city = data.get("city")
-            country = data.get("country")
-            # Return full location string, lat, lon – no country filter
-            location_name = f"{city}, {country}" if city and country else f"{lat:.3f}, {lon:.3f}"
-            return location_name, lat, lon
-        else:
-            st.warning("IP location service failed. Defaulting to London (global fallback).")
-            return "London, UK", 51.5074, -0.1278
-    except Exception:
-        st.warning("Could not detect location. Using London, UK as fallback.")
-        return "London, UK", 51.5074, -0.1278
-
-# ========== 3. Ballistic performance functions ==========
+# ========== Performance functions ==========
 def flight_time(v0, theta_deg):
     rad = np.radians(theta_deg)
     return 2 * v0 * np.sin(rad) / g
@@ -116,15 +65,31 @@ def apex_height(v0, theta_deg):
 def horizontal_range(v0, theta_deg):
     return (v0**2 * np.sin(2 * np.radians(theta_deg))) / g
 
-# ========== 4. Session state initialisation ==========
+# ========== Check URL for coordinates from geolocation ==========
+query_params = st.query_params
+if "lat" in query_params and "lon" in query_params:
+    try:
+        user_lat = float(query_params["lat"])
+        user_lon = float(query_params["lon"])
+        st.session_state.user_lat = user_lat
+        st.session_state.user_lon = user_lon
+        st.session_state.location_source = "device"
+        # Clear params so they don't persist
+        st.query_params.clear()
+    except:
+        pass
+
+# ========== Session state defaults ==========
+if "user_lat" not in st.session_state:
+    st.session_state.user_lat = None
+if "user_lon" not in st.session_state:
+    st.session_state.user_lon = None
 if "wind_speed" not in st.session_state:
     st.session_state.wind_speed = 25
 if "wind_dir" not in st.session_state:
     st.session_state.wind_dir = 90
 if "user_heading" not in st.session_state:
     st.session_state.user_heading = 0
-if "selected_location" not in st.session_state:
-    st.session_state.selected_location = "Not set"
 if "pressure" not in st.session_state:
     st.session_state.pressure = REGULATED_PSI
 if "barrel" not in st.session_state:
@@ -135,81 +100,85 @@ if "rain" not in st.session_state:
     st.session_state.rain = False
 if "load_height" not in st.session_state:
     st.session_state.load_height = LOAD_HEIGHT_DEFAULT
+if "weather_fetched" not in st.session_state:
+    st.session_state.weather_fetched = False
 
-# ========== 5. Sidebar – Auto location & manual override ==========
-st.sidebar.header("📍 Location & Wind")
+# ========== Sidebar ==========
+st.sidebar.header("📍 Your Device Location")
 
-# Client-side button: requests browser geolocation and navigates top window
+# Geolocation button (HTML/JS)
+geo_html = """
+<div id="geo-status" style="margin-bottom: 10px; font-size:0.9rem;"></div>
+<button id="get-location" style="padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">📍 Get My Device Location</button>
+<script>
+    const statusDiv = document.getElementById('geo-status');
+    const btn = document.getElementById('get-location');
+    btn.onclick = () => {
+        if (!navigator.geolocation) {
+            statusDiv.innerHTML = "Geolocation not supported by this browser.";
+            return;
+        }
+        statusDiv.innerHTML = "Requesting permission...";
+        navigator.geolocation.getCurrentPosition(
+            (position) => {
+                const lat = position.coords.latitude;
+                const lon = position.coords.longitude;
+                const url = new URL(window.location.href);
+                url.searchParams.set('lat', lat);
+                url.searchParams.set('lon', lon);
+                window.location.href = url.toString();
+            },
+            (error) => {
+                statusDiv.innerHTML = "Error: " + error.message;
+            }
+        );
+    };
+</script>
+"""
 with st.sidebar:
-        geo_html = """
-        <div style="text-align:center; padding:6px 0;">
-            <button id="get-location" style="padding:8px 12px; font-size:0.95rem;">📍 Use my device location</button>
-            <div id="geo-status" style="font-size:0.85rem; margin-top:6px;"></div>
-        </div>
-        <script>
-            const btn = document.getElementById('get-location');
-            const status = document.getElementById('geo-status');
-            btn.onclick = () => {
-                if (!navigator.geolocation) { status.innerText = 'Geolocation not supported by this browser.'; return; }
-                status.innerText = 'Requesting permission...';
-                navigator.geolocation.getCurrentPosition(function(position) {
-                    const lat = position.coords.latitude;
-                    const lon = position.coords.longitude;
-                    const url = new URL(window.location.href);
-                    url.searchParams.set('lat', lat);
-                    url.searchParams.set('lon', lon);
-                    // Navigate the top-level window so the request originates from the user's browser
-                    try { window.top.location.href = url.toString(); } catch(e) { window.location.href = url.toString(); }
-                }, function(err) { status.innerText = 'Error: ' + err.message; }, { enableHighAccuracy: true, timeout: 10000 });
-            };
-        </script>
-        """
-        st.components.v1.html(geo_html, height=130)
+    st.components.v1.html(geo_html, height=120)
+    st.caption("Click button, allow permission, then page reloads with your location.")
 
-auto_button = st.sidebar.button("🌐 Auto‑detect my location & weather (IP‑based fallback)")
-if auto_button:
-    with st.spinner("Detecting your location and fetching weather..."):
-        loc_name, lat, lon = get_location_from_ip()
-        st.session_state.selected_location = loc_name
-        speed, direction = get_weather(lat, lon)
-        if speed is not None:
-            st.session_state.wind_speed = speed
-            st.session_state.wind_dir = direction
-            st.sidebar.success(f"📍 Location: {loc_name}")
-            st.sidebar.success(f"🌬️ Wind: {speed} km/h from {direction}°")
-        else:
-            st.sidebar.error("Could not fetch weather – using previous wind values or manual override.")
+# Show location status and fetch weather if we have coordinates
+if st.session_state.user_lat is not None:
+    st.sidebar.success(f"📍 Coordinates: {st.session_state.user_lat:.3f}, {st.session_state.user_lon:.3f}")
+    if not st.session_state.weather_fetched:
+        with st.spinner("Fetching wind data for your location..."):
+            speed, direction = get_weather(st.session_state.user_lat, st.session_state.user_lon)
+            if speed is not None:
+                st.session_state.wind_speed = speed
+                st.session_state.wind_dir = direction
+                st.sidebar.success(f"🌬️ Wind: {speed:.1f} km/h from {direction:.0f}°")
+            else:
+                st.sidebar.warning("Wind data unavailable. Use manual override below.")
+            st.session_state.weather_fetched = True
+else:
+    st.sidebar.info("No location yet. Click the button above.")
 
+# Manual override
 st.sidebar.markdown("---")
 st.sidebar.subheader("✍️ Manual Override")
-use_manual = st.sidebar.checkbox("Use manual values", value=False)
+use_manual = st.sidebar.checkbox("Use manual wind/heading", value=False)
 if use_manual:
-    manual_city = st.sidebar.text_input("City (label only)", "Anywhere")
-    manual_wind_speed = st.sidebar.number_input("Manual wind speed (km/h)", 0, 100, 25)
-    manual_wind_dir = st.sidebar.number_input("Manual wind direction (deg)", 0, 360, 90)
-    manual_heading = st.sidebar.number_input("Your heading (deg, 0=N)", 0, 360, 0)
-    st.session_state.wind_speed = manual_wind_speed
-    st.session_state.wind_dir = manual_wind_dir
+    manual_speed = st.sidebar.number_input("Wind speed (km/h)", 0, 100, st.session_state.wind_speed)
+    manual_dir = st.sidebar.number_input("Wind direction (deg)", 0, 360, st.session_state.wind_dir)
+    manual_heading = st.sidebar.number_input("Your heading (deg, 0=N)", 0, 360, st.session_state.user_heading)
+    st.session_state.wind_speed = manual_speed
+    st.session_state.wind_dir = manual_dir
     st.session_state.user_heading = manual_heading
-    st.session_state.selected_location = f"Manual: {manual_city}"
-else:
-    # If manual is off, keep whatever was set by auto or earlier
-    pass
 
-# Show current settings
-st.sidebar.metric("📍 Location", st.session_state.selected_location)
 st.sidebar.metric("🌬️ Wind used", f"{st.session_state.wind_speed} km/h from {st.session_state.wind_dir}°")
 st.sidebar.metric("🧭 Your heading", f"{st.session_state.user_heading}° (0=N)")
 
-# ========== 6. Advanced settings ==========
+# ========== Advanced settings ==========
 with st.expander("⚙️ Advanced Launcher Settings"):
     pressure_psi = st.slider("Regulated Pressure (PSI)", 35, 70, st.session_state.pressure)
     barrel_type = st.radio("Barrel Type", ["Optimised Helical (Kv = 0.24)", "Standard (Kv = 0.20)"],
-                           index=0 if st.session_state.barrel == "Optimised Helical (Kv = 0.24)" else 1)
+                           index=0 if "Optimised" in st.session_state.barrel else 1)
     angle_deg = st.slider("Launch Angle (degrees)", 55, 75, st.session_state.angle)
     rain = st.checkbox("Rain (2% velocity penalty)", st.session_state.rain)
     load_height = st.number_input("Load Height (m)", 3.0, 6.0, st.session_state.load_height, 0.1)
-    # Update session state
+    # Update session
     st.session_state.pressure = pressure_psi
     st.session_state.barrel = barrel_type
     st.session_state.angle = angle_deg
@@ -218,7 +187,7 @@ with st.expander("⚙️ Advanced Launcher Settings"):
 
 kv = 0.24 if "Optimised" in st.session_state.barrel else 0.20
 
-# ========== 7. Crosswind & azimuth calculation ==========
+# ========== Crosswind & azimuth calculation ==========
 wind_speed = st.session_state.wind_speed
 wind_dir = st.session_state.wind_dir
 heading = st.session_state.user_heading
@@ -242,7 +211,7 @@ if crosswind_kmh > 0:
 else:
     raw = gyro_drift = offset_m = azimuth_angle = net_d = 0
 
-# ========== 8. Main results ==========
+# ========== Results ==========
 st.header("🎯 Azimuth Offset (Primary Output)")
 col1, col2, col3 = st.columns([2, 2, 1])
 with col1:
@@ -251,25 +220,25 @@ with col1:
         st.metric("🌀 Rotate bipod UPWIND by", f"{azimuth_angle:.1f}°",
                   delta=f"→ cancels {gyro_drift:.2f} m drift", delta_color="normal")
     else:
-        st.success("✅ No crosswind component (wind aligned with your heading).")
+        st.success("✅ No crosswind component.")
         st.metric("Azimuth offset", "0.0°", delta="No rotation needed")
 with col2:
-    st.metric("📏 Raw drift (no gyro)", f"{raw:.2f} m" if crosswind_kmh > 0 else "0 m")
-    st.metric("⚙️ After gyro stabilisation", f"{gyro_drift:.2f} m" if crosswind_kmh > 0 else "0 m")
+    st.metric("📏 Raw drift", f"{raw:.2f} m" if crosswind_kmh > 0 else "0 m")
+    st.metric("⚙️ After gyro (helical barrel)", f"{gyro_drift:.2f} m" if crosswind_kmh > 0 else "0 m")
     st.metric("🎯 Net drift", f"{net_d:.2f} m", delta="✅ Canceled" if net_d < 0.1 else "⚠️")
 with col3:
     required_apex = st.session_state.load_height + 0.4
-    st.metric("Apex height / Load clearance", f"{apex:.2f} m",
+    st.metric("Apex height / Clear load", f"{apex:.2f} m",
               delta="✅ PASS" if apex >= required_apex else "❌ FAIL")
-    st.metric("Horizontal range / Trailer width", f"{range_m:.1f} m",
+    st.metric("Horizontal range", f"{range_m:.1f} m",
               delta="✅ PASS" if range_m >= 2.4 else "❌ FAIL")
 
 if crosswind_kmh > 0:
-    st.info(f"👉 **Operator instruction:** Rotate the bipod **{azimuth_angle:.1f} degrees upwind** (toward the wind) before each launch. This cancels the crosswind drift.")
+    st.info(f"👉 **Operator instruction:** Rotate bipod **{azimuth_angle:.1f} degrees upwind** before launching.")
 else:
     st.info("✅ Aim straight across the trailer. No azimuth offset needed.")
 
-# ========== 9. Optional load simulation ==========
+# ========== Optional mission simulation ==========
 st.divider()
 st.subheader("📋 Full Load Mission Check (optional)")
 num_straps = st.slider("Number of straps", 6, 13, 10)
@@ -309,12 +278,12 @@ if st.button("▶️ Run Mission Check"):
             "Success": "✅" if success else "❌"
         })
         progress.progress(i / num_straps)
-        status.info(f"Strap {i}/{num_straps}: apex {a:.2f} m – {'✅' if success else '❌'}")
+        status.info(f"Strap {i}/{num_straps}: apex {a:.2f}m – {'✅' if success else '❌'}")
         time.sleep(0.15)
         if i < num_straps:
             cylinder = max(35, cylinder - drop_per_shot)
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True)
-    st.success(f"Completed {df[df['Success']=='✅'].shape[0]}/{num_straps} straps. Cylinder swaps: {swaps}")
+    st.success(f"Completed {df[df['Success']=='✅'].shape[0]}/{num_straps} straps. Swaps: {swaps}")
 
-st.caption("Data sources: Open‑Meteo (weather), ip-api.com (IP‑based geolocation). Works globally – no country restrictions.")
+st.caption("📱 On phone: tap the green button, allow location, then the page reloads with your GPS coordinates. Wind data is fetched live. Use manual override if needed.")
