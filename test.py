@@ -3,15 +3,12 @@ import pandas as pd
 import numpy as np
 import requests
 import time
-from streamlit_geolocation import streamlit_geolocation
 
+st.set_page_config(page_title="ASLS Global – Azimuth Offset Planner", layout="wide")
 
-st.set_page_config(page_title="ASLS – Azimuth Offset Planner", layout="wide")
-
-st.title("ASLS – Wind‑Based Azimuth Offset Planner")
+st.title("🌍 ASLS Global – Wind‑Based Azimuth Offset Planner")
 st.markdown(
-    "Get the **azimuth offset** (degrees to rotate bipod upwind) for your pneumatic strap launcher. "
-    "Works anywhere in the world."
+    "Get the **azimuth offset** (degrees to rotate bipod upwind) for your pneumatic strap launcher."
 )
 
 # ========== Constants ==========
@@ -83,8 +80,8 @@ for key in ["wind_speed", "wind_dir", "selected_location", "user_heading"]:
     if key not in st.session_state:
         st.session_state[key] = None if key == "user_heading" else (0 if "wind" in key else None)
 
-# ========== Sidebar – Location (reordered) ==========
-st.sidebar.header("Choose Your Location")
+# ========== Sidebar – Location ==========
+st.sidebar.header("📍 Choose Your Location")
 location_option = st.sidebar.radio(
     "Location source",
     ["Use my current location (global)", "Brisbane", "Adelaide", "Sydney", "Perth"]
@@ -97,38 +94,56 @@ city_coords = {
     "Perth": (-31.9505, 115.8605)
 }
 
-if location_option == "🔴 Use my current location (global)":
-    with st.sidebar:
-        location_data = streamlit_geolocation()
-    if location_data:
-        lat = location_data.get("latitude")
-        lon = location_data.get("longitude")
-        accuracy = location_data.get("accuracy")     
-
-        if lat and lon:
-            # Optionally show accuracy to the user
-            if accuracy:
-                st.sidebar.caption(f"📍 Location accuracy: ~{accuracy:.0f} meters")
-
-            with st.spinner(f"Fetching live wind data for your location (Lat: {lat:.3f}, Lon: {lon:.3f})..."):
-                wind_speed, wind_dir = fetch_openmeteo_weather(lat, lon)
-                if wind_speed is not None:
-                    st.session_state.wind_speed = wind_speed
-                    st.session_state.wind_dir = wind_dir
-                    st.sidebar.success(f"✅ Your location: {wind_speed:.1f} km/h, direction {wind_dir:.0f}°")
-                else:
-                    st.sidebar.error("Weather fetch failed.")
-                    st.session_state.wind_speed = 0
-                    st.session_state.wind_dir = 0
+if location_option == "Use my current location (global)":
+    with st.spinner("Detecting your location ..."):
+        lat, lon, country, city = get_my_location()
+    if lat is not None:
+        location_name = f"{city or 'Your location'}, {country or 'Unknown'}"
+        st.session_state.selected_location = location_name
+        with st.spinner(f"Fetching live wind data for {city or 'your area'} ..."):
+            wind_speed, wind_dir = fetch_openmeteo_weather(lat, lon)
+        if wind_speed is not None:
+            st.session_state.wind_speed = wind_speed
+            st.session_state.wind_dir = wind_dir
+            st.sidebar.success(f"✅ {location_name}: {wind_speed:.1f} km/h, dir {wind_dir:.0f}°")
         else:
-            st.sidebar.error("Could not get coordinates. Check browser permissions.")
+            st.sidebar.error("Weather fetch failed. Using manual override mode.")
+            st.session_state.wind_speed = 0
+            st.session_state.wind_dir = 0
     else:
-        st.sidebar.warning("Location not available. Please choose a city or ensure browser location is enabled.")
+        st.sidebar.error("Could not detect location. Choose a city or use manual wind.")
+        st.session_state.wind_speed = 0
+        st.session_state.wind_dir = 0
+elif location_option in city_coords:
+    lat, lon = city_coords[location_option]
+    st.session_state.selected_location = location_option
+    with st.spinner(f"Fetching live wind data for {location_option} ..."):
+        wind_speed, wind_dir = fetch_openmeteo_weather(lat, lon)
+    if wind_speed is not None:
+        st.session_state.wind_speed = wind_speed
+        st.session_state.wind_dir = wind_dir
+        st.sidebar.success(f"✅ {location_option}: {wind_speed:.1f} km/h, dir {wind_dir:.0f}°")
+    else:
+        st.sidebar.error("Weather fetch failed. Using manual override mode.")
         st.session_state.wind_speed = 0
         st.session_state.wind_dir = 0
 
+# ========== Manual wind override (for testing) ==========
+st.sidebar.divider()
+st.sidebar.subheader("🌬️ Manual Wind Override")
+use_manual_wind = st.sidebar.checkbox("Override with manual wind values", value=False)
+if use_manual_wind:
+    manual_speed = st.sidebar.number_input("Manual wind speed (km/h)", 0, 100, 25)
+    manual_dir = st.sidebar.number_input("Manual wind direction (degrees)", 0, 360, 90)
+    st.session_state.wind_speed = manual_speed
+    st.session_state.wind_dir = manual_dir
+    st.sidebar.info(f"Using manual wind: {manual_speed} km/h from {manual_dir}°")
+
+# Display current wind values for debugging
+st.sidebar.write(f"🌬️ **Current wind:** {st.session_state.wind_speed} km/h, direction {st.session_state.wind_dir}°")
+
 # ========== Compass / Heading Input ==========
-st.sidebar.subheader("Your Facing Direction")
+st.sidebar.subheader("🧭 Your Facing Direction")
 
 compass_html = """
 <div style="text-align:center; padding:10px;">
@@ -190,17 +205,18 @@ compass_html = """
 
 with st.sidebar:
     st.components.v1.html(compass_html, height=180)
-    st.caption("On phones, tap the button and allow permission. Then copy the heading below. On Laptops, open your phone and use the inbuilt compass to get the direction or just open this website on your phone")
+    st.caption("On phones, tap the button and allow permission. Then copy the heading below.")
 
 manual_heading = st.sidebar.number_input(
-    "Enter your facing direction (degrees, 0‑360)",
+    "👉 Enter your facing direction (degrees, 0‑360)",
     min_value=0, max_value=360, value=0, step=1,
     help="0° = North, 90° = East, 180° = South, 270° = West."
 )
 st.session_state.user_heading = manual_heading
+st.sidebar.write(f"🧭 **Your heading:** {st.session_state.user_heading}°")
 
 # ========== Advanced Settings ==========
-with st.expander("Advanced Settings (override defaults)"):
+with st.expander("⚙️ Advanced Settings (override defaults)"):
     pressure_psi = st.slider("Regulated Pressure (PSI)", 35, 70, REGULATED_PSI)
     barrel_type = st.radio("Barrel Type", ["Optimised Helical (Kv = 0.24)", "Standard (Kv = 0.20)"])
     kv = 0.24 if "Optimised" in barrel_type else 0.20
@@ -209,9 +225,14 @@ with st.expander("Advanced Settings (override defaults)"):
     load_height = st.number_input("Load Height (m)", 3.0, 6.0, 4.3, step=0.1)
 
 # ========== Crosswind & Azimuth Offset ==========
-if st.session_state.wind_speed and st.session_state.wind_speed > 0 and st.session_state.user_heading is not None:
-    rel_angle_rad = np.radians(st.session_state.wind_dir - st.session_state.user_heading)
-    crosswind_kmh = abs(st.session_state.wind_speed * np.sin(rel_angle_rad))
+# Ensure we have numbers
+wind_speed = st.session_state.wind_speed if st.session_state.wind_speed is not None else 0
+wind_dir = st.session_state.wind_dir if st.session_state.wind_dir is not None else 0
+heading = st.session_state.user_heading if st.session_state.user_heading is not None else 0
+
+if wind_speed > 0:
+    rel_angle_rad = np.radians(wind_dir - heading)
+    crosswind_kmh = abs(wind_speed * np.sin(rel_angle_rad))
 else:
     crosswind_kmh = 0
 
@@ -232,21 +253,21 @@ else:
     raw = gyro_drift = azimuth_offset_m = azimuth_angle_deg = net_drift_val = 0
 
 # ========== Main Output ==========
-st.header("Azimuth Offset")
+st.header("🎯 Azimuth Offset (Main Result)")
 col1, col2, col3 = st.columns([2, 2, 1])
 with col1:
     if crosswind_kmh > 0:
-        st.metric("Crosswind Component", f"{crosswind_kmh:.1f} km/h",
-                  help="Wind perpendicular to your facing direction")
-        st.metric("Rotate Bipod UPWIND by", f"{azimuth_angle_deg:.1f}°",
+        st.metric("🌬️ Crosswind Component", f"{crosswind_kmh:.1f} km/h")
+        st.metric("🌀 Rotate Bipod UPWIND by", f"{azimuth_angle_deg:.1f}°",
                   delta=f"→ Compensates {gyro_drift:.2f} m drift", delta_color="normal")
     else:
-        st.info("No crosswind component – no azimuth offset needed.")
+        st.warning("No crosswind component detected (wind speed zero, wind aligned, or heading default).\n\nIf this is unexpected, use **Manual Wind Override** in the sidebar to set wind speed/direction and try again.")
+        st.metric("🌀 Azimuth Offset", "0°", delta="No correction needed")
 with col2:
-    st.metric("Raw Lateral Drift", f"{raw:.2f} m" if crosswind_kmh > 0 else "0 m")
-    st.metric("After Gyro (-35%)", f"{gyro_drift:.2f} m" if crosswind_kmh > 0 else "0 m")
-    st.metric(" Net Drift", f"{net_drift_val:.2f} m", 
-              delta="Cancelled" if net_drift_val < 0.1 else "⚠️ Residual")
+    st.metric("📏 Raw Lateral Drift", f"{raw:.2f} m" if crosswind_kmh > 0 else "0 m")
+    st.metric("⚙️ After Gyro (-35%)", f"{gyro_drift:.2f} m" if crosswind_kmh > 0 else "0 m")
+    st.metric("🎯 Net Drift", f"{net_drift_val:.2f} m", 
+              delta="✅ Cancelled" if net_drift_val < 0.1 else "⚠️ Residual")
 with col3:
     st.metric("Apex Height", f"{apex:.2f} m", 
               delta="PASS" if apex >= load_height + 0.4 else "FAIL")
@@ -254,15 +275,15 @@ with col3:
               delta="PASS" if range_m >= 2.4 else "FAIL")
 
 if crosswind_kmh > 0:
-    st.success(f"**Instruction:** Rotate the bipod **{azimuth_angle_deg:.1f} degrees upwind** before launching.")
+    st.success(f"**👉 Instruction:** Rotate the bipod **{azimuth_angle_deg:.1f} degrees upwind** before launching.")
 else:
-    st.success("Aim straight across the trailer (no crosswind).")
+    st.info("✅ No crosswind component – aim straight across the trailer.\n\nIf you expected wind, check the **Manual Wind Override** checkbox in the sidebar and set typical values (e.g., 25 km/h from 90°).")
 
 # ========== Mission Simulation ==========
 st.divider()
-st.subheader("Full Load Mission Check (optional)")
+st.subheader("📋 Full Load Mission Check (optional)")
 num_straps = st.slider("Number of straps", 6, 13, 10)
-if st.button("Run Mission Check"):
+if st.button("▶️ Run Mission Check"):
     cylinder = 60.0
     drop_per_shot = (60 - 35) / 12
     swaps = 0
@@ -306,4 +327,4 @@ if st.button("Run Mission Check"):
     st.dataframe(df, use_container_width=True)
     st.success(f"**Completed {df[df['Success']=='✅'].shape[0]}/{num_straps} straps.** Cylinder swaps: {swaps}")
 
-st.caption("Data sources: Open‑Meteo (weather), ip-api.com (location). Compass uses DeviceOrientationEvent.")
+st.caption("Use the **Manual Wind Override** in the sidebar if live weather fails. Then adjust your heading and see the azimuth offset update.")
