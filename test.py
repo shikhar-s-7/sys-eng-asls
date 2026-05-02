@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+from streamlit_geolocation import streamlit_geolocation
+
 
 st.set_page_config(page_title="ASLS – Azimuth Offset Planner", layout="wide")
 
@@ -95,42 +97,35 @@ city_coords = {
     "Perth": (-31.9505, 115.8605)
 }
 
-if location_option == "Use my current location (global)":
-    with st.spinner("Detecting your location ..."):
-        lat, lon, country, city = get_my_location()
-    if lat is not None:
-        location_name = f"{city or 'Your location'}, {country or 'Unknown'}"
-        st.session_state.selected_location = location_name
-        with st.spinner(f"Fetching live wind data for {city or 'your area'} ..."):
-            wind_speed, wind_dir = fetch_openmeteo_weather(lat, lon)
-        if wind_speed is not None:
-            st.session_state.wind_speed = wind_speed
-            st.session_state.wind_dir = wind_dir
-            st.sidebar.success(f"{location_name}: {wind_speed:.1f} km/h, dir {wind_dir:.0f}°")
+if location_option == "🔴 Use my current location (global)":
+    with st.sidebar:
+        location_data = streamlit_geolocation()
+    if location_data:
+        lat = location_data.get("latitude")
+        lon = location_data.get("longitude")
+        accuracy = location_data.get("accuracy")     
+
+        if lat and lon:
+            # Optionally show accuracy to the user
+            if accuracy:
+                st.sidebar.caption(f"📍 Location accuracy: ~{accuracy:.0f} meters")
+
+            with st.spinner(f"Fetching live wind data for your location (Lat: {lat:.3f}, Lon: {lon:.3f})..."):
+                wind_speed, wind_dir = fetch_openmeteo_weather(lat, lon)
+                if wind_speed is not None:
+                    st.session_state.wind_speed = wind_speed
+                    st.session_state.wind_dir = wind_dir
+                    st.sidebar.success(f"✅ Your location: {wind_speed:.1f} km/h, direction {wind_dir:.0f}°")
+                else:
+                    st.sidebar.error("Weather fetch failed.")
+                    st.session_state.wind_speed = 0
+                    st.session_state.wind_dir = 0
         else:
-            st.sidebar.error("Weather fetch failed.")
-            st.session_state.wind_speed = 0
-            st.session_state.wind_dir = 0
+            st.sidebar.error("Could not get coordinates. Check browser permissions.")
     else:
-        st.sidebar.error("Could not detect location. Choose a city instead.")
+        st.sidebar.warning("Location not available. Please choose a city or ensure browser location is enabled.")
         st.session_state.wind_speed = 0
         st.session_state.wind_dir = 0
-elif location_option in city_coords:
-    lat, lon = city_coords[location_option]
-    st.session_state.selected_location = location_option
-    with st.spinner(f"Fetching live wind data for {location_option} ..."):
-        wind_speed, wind_dir = fetch_openmeteo_weather(lat, lon)
-    if wind_speed is not None:
-        st.session_state.wind_speed = wind_speed
-        st.session_state.wind_dir = wind_dir
-        st.sidebar.success(f"{location_option}: {wind_speed:.1f} km/h, dir {wind_dir:.0f}°")
-    else:
-        st.sidebar.error("Weather fetch failed.")
-else:
-    # Fallback (should not happen)
-    st.sidebar.error("Invalid selection.")
-    st.session_state.wind_speed = 0
-    st.session_state.wind_dir = 0
 
 # ========== Compass / Heading Input ==========
 st.sidebar.subheader("Your Facing Direction")
