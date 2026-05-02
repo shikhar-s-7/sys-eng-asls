@@ -47,6 +47,7 @@ export default function LocationPanel({ state, onLocationObtained, onManualWeath
 
   const stopCompass = useCallback(() => {
     if (listenerRef.current) {
+      window.removeEventListener('deviceorientationabsolute', listenerRef.current as EventListener);
       window.removeEventListener('deviceorientation', listenerRef.current);
       listenerRef.current = null;
     }
@@ -56,21 +57,21 @@ export default function LocationPanel({ state, onLocationObtained, onManualWeath
 
   const startCompass = useCallback(async () => {
     setCompassError(null);
+    let gotReading = false;
 
     const handler = (e: DeviceOrientationEvent) => {
-      // iOS gives webkitCompassHeading (already magnetic north relative)
-      // Android gives alpha (degrees from north, but may need 360 - alpha)
       let heading: number | null = null;
 
-      if (typeof e.webkitCompassHeading === 'number') {
-        // iOS
+      if (typeof e.webkitCompassHeading === 'number' && e.webkitCompassHeading >= 0) {
+        // iOS Safari — already true magnetic north, clockwise
         heading = e.webkitCompassHeading;
-      } else if (e.alpha !== null) {
-        // Android — alpha is CCW from north, convert to CW
+      } else if (typeof e.alpha === 'number' && e.alpha !== null) {
+        // Android deviceorientationabsolute — alpha is CCW from true north, convert to CW
         heading = (360 - e.alpha) % 360;
       }
 
-      if (heading !== null) {
+      if (heading !== null && !isNaN(heading)) {
+        gotReading = true;
         const rounded = Math.round(heading);
         setLiveHeading(rounded);
         onHeadingChange(rounded);
@@ -100,8 +101,32 @@ export default function LocationPanel({ state, onLocationObtained, onManualWeath
     }
 
     listenerRef.current = handler;
-    window.addEventListener('deviceorientation', handler, true);
-    setCompassState('active');
+
+    // deviceorientationabsolute gives alpha relative to true geographic north on Android.
+    // Regular deviceorientation alpha is relative to wherever the phone was pointing
+    // when the page loaded — useless as a compass. Always prefer the absolute version.
+    const supportsAbsolute = 'ondeviceorientationabsolute' in window;
+    if (supportsAbsolute) {
+      window.addEventListener('deviceorientationabsolute', handler as EventListener, true);
+    } else {
+      // iOS falls back here — webkitCompassHeading handles the north correction above
+      window.addEventListener('deviceorientation', handler, true);
+    }
+
+    setCompassState('requesting');
+
+    setTimeout(() => {
+      if (!gotReading) {
+        if (supportsAbsolute) {
+          window.removeEventListener('deviceorientationabsolute', handler as EventListener, true);
+        } else {
+          window.removeEventListener('deviceorientation', handler, true);
+        }
+        listenerRef.current = null;
+        setCompassState('error');
+        setCompassError('Brave blocks the compass sensor by default. Open in Chrome or Samsung Internet, or enter heading manually.');
+      }
+    }, 3000);
   }, [onHeadingChange]);
 
   // Clean up listener on unmount
